@@ -69,11 +69,14 @@ export default function Scanner({ onComplete, onBack }: Props) {
 
       const { r, g, b } = extractRoi(ctx, video.videoWidth, video.videoHeight)
 
-      // Sanity check: NaN means camera gave us nothing
+      // Sanity check: NaN or all-black means camera not ready yet
       if (isNaN(r) || isNaN(g) || isNaN(b)) return
+      if (r === 0 && g === 0 && b === 0) return
 
-      // Skin tone check: RGB values typical for human face under normal lighting
-      const isFace = g > 35 && g < 230 && r > 20 && b > 10
+      // Loose check: any non-black pixels with some brightness means signal present
+      // (mobile cameras vary widely in color response — keep this permissive)
+      const brightness = (r + g + b) / 3
+      const isFace = brightness > 20 && brightness < 245
       setFaceDetected(isFace)
 
       framesRef.current.push({ r, g, b, timestamp: now })
@@ -114,24 +117,45 @@ export default function Scanner({ onComplete, onBack }: Props) {
 
   const startCamera = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          facingMode: 'user',
-          frameRate: { ideal: 30 },
-        },
-        audio: false,
-      })
+      // Try constraints from most specific to most compatible.
+      // Mobile browsers (especially Android) often reject width/height/frameRate
+      // constraints and return a silent black stream — so we fall back to bare minimum.
+      const attempts: MediaStreamConstraints[] = [
+        { video: { facingMode: 'user' }, audio: false },
+        { video: { facingMode: { ideal: 'user' } }, audio: false },
+        { video: true, audio: false },
+      ]
+
+      let stream: MediaStream | null = null
+      let lastError: unknown = null
+      for (const constraints of attempts) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints)
+          break
+        } catch (e) {
+          lastError = e
+        }
+      }
+      if (!stream) throw lastError
+
       streamRef.current = stream
       const video = videoRef.current
       if (video) {
+        // Set attributes programmatically — critical for iOS Safari and Android Chrome
+        video.muted = true
+        video.setAttribute('playsinline', '')
+        video.setAttribute('autoplay', '')
         video.srcObject = stream
-        await video.play()
-        // Wait for video to report actual dimensions (some browsers need a frame)
+
+        // play() can throw on some mobile browsers; the autoplay attribute handles it
+        try { await video.play() } catch { /* autoplay attribute takes over */ }
+
+        // Wait for dimensions with a 4-second timeout — some devices are slow to init
         await new Promise<void>(resolve => {
+          let ticks = 0
           const check = () => {
-            if (video.videoWidth > 0) { resolve(); return }
+            if (video.videoWidth > 0 && video.videoHeight > 0) { resolve(); return }
+            if (++ticks > 80) { resolve(); return } // 4s max, then continue anyway
             setTimeout(check, 50)
           }
           check()
@@ -140,12 +164,12 @@ export default function Scanner({ onComplete, onBack }: Props) {
       setPhase('setup')
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
-      if (msg.includes('Permission') || msg.includes('NotAllowed')) {
-        setErrorMsg('Camera permission denied. Please click "Allow" when the browser asks, then try again.')
+      if (msg.includes('Permission') || msg.includes('NotAllowed') || msg.includes('denied')) {
+        setErrorMsg('Camera permission denied. Tap the camera icon in your browser address bar and allow access, then refresh.')
       } else if (msg.includes('NotFound') || msg.includes('DevicesNotFound')) {
-        setErrorMsg('No camera found. Please connect a camera and try again.')
+        setErrorMsg('No camera found on this device.')
       } else {
-        setErrorMsg('Could not access the camera. Try refreshing the page.')
+        setErrorMsg('Could not access the camera. Make sure you are on HTTPS and try refreshing.')
       }
       setPhase('error')
     }
@@ -247,6 +271,7 @@ export default function Scanner({ onComplete, onBack }: Props) {
               <video
                 ref={videoRef}
                 className="w-full h-full object-cover scale-x-[-1]"
+                autoPlay
                 muted
                 playsInline
               />
